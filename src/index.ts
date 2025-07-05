@@ -4,6 +4,7 @@ import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { serve } from '@hono/node-server';
 import 'dotenv/config'
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 // Types
 interface SlackChannel {
@@ -11,6 +12,7 @@ interface SlackChannel {
   name: string;
   is_private: boolean;
   is_archived: boolean;
+  is_member?: boolean;
   created: number;
   topic?: {
     value: string;
@@ -70,6 +72,70 @@ const handleSlackError = (error: any) => {
     status: 500
   };
 };
+
+// GET /bot-channels - Get all channels the bot is a member of
+app.get('/bot-channels', async (c) => {
+  try {
+    const slack = getSlackClient();
+    const botChannels: SlackChannel[] = [];
+    let cursor: string | undefined;
+    let hasMore = true;
+
+    // Paginate through all channels (both public and private)
+    while (hasMore) {
+      try {
+        const channelsResponse = await slack.conversations.list({
+          types: 'public_channel,private_channel',
+          exclude_archived: false, // Include archived channels to show full membership
+          limit: 200,
+          cursor
+        });
+
+        if (!channelsResponse.ok || !channelsResponse.channels) {
+          throw new Error(channelsResponse.error || 'Failed to fetch channels');
+        }
+
+        const channels = channelsResponse.channels as SlackChannel[];
+
+        // Add all channels that the bot can see (which means it's a member of)
+        // The bot can only see channels it's a member of when using conversations.list
+        for (const channel of channels) {
+          if(channel.is_member){
+            botChannels.push({
+              id: channel.id,
+              name: channel.name,
+              is_private: channel.is_private,
+              is_archived: channel.is_archived,
+              created: channel.created,
+              topic: channel.topic,
+              purpose: channel.purpose
+            });
+          }
+        }
+
+        cursor = channelsResponse.response_metadata?.next_cursor;
+        hasMore = !!cursor;
+      } catch (apiError) {
+        const errorResponse = handleSlackError(apiError);
+        return c.json({ error: errorResponse.error }, errorResponse.status as ContentfulStatusCode);
+      }
+    }
+
+    const response: ChannelsResponse = {
+      channels: botChannels
+    };
+
+    return c.json(response);
+  } catch (error) {
+    console.error('Error in /bot-channels endpoint:', error);
+    
+    if (error instanceof Error && error.message.includes('SLACK_BOT_TOKEN')) {
+      return c.json({ error: 'Slack bot token not configured' }, 500);
+    }
+    
+    return c.json({ error: 'Failed to fetch bot channels' }, 500);
+  }
+});
 
 // GET /channels?userId=<slackUserId>
 app.get('/channels', async (c) => {
@@ -134,7 +200,7 @@ app.get('/channels', async (c) => {
         hasMore = !!cursor;
       } catch (apiError) {
         const errorResponse = handleSlackError(apiError);
-        return c.json({ error: errorResponse.error }, errorResponse.status);
+        return c.json({ error: errorResponse.error }, errorResponse.status as ContentfulStatusCode);
       }
     }
 
@@ -236,7 +302,11 @@ app.get('/messages', async (c) => {
       });
 
       const response: MessagesResponse & { has_more?: boolean; next_cursor?: string } = {
-        messages: enhancedMessages
+        messages: enhancedMessages.map(msg => ({
+          ...msg,
+          user_details: msg.user_details === null ? undefined : msg.user_details,
+          username: msg.username === null ? undefined : msg.username,
+        }))
       };
 
       // Add pagination info if available
@@ -250,7 +320,7 @@ app.get('/messages', async (c) => {
       return c.json(response);
     } catch (apiError) {
       const errorResponse = handleSlackError(apiError);
-      return c.json({ error: errorResponse.error }, errorResponse.status);
+      return c.json({ error: errorResponse.error }, errorResponse.status as ContentfulStatusCode);
     }
   } catch (error) {
     console.error('Error in /messages endpoint:', error);
@@ -273,6 +343,7 @@ app.get('/', (c) => {
   return c.json({
     message: 'Slack API Service',
     endpoints: {
+      'bot-channels': 'GET /bot-channels',
       channels: 'GET /channels?userId=<slackUserId>',
       messages: 'GET /messages?channelId=<channelId>&limit=<limit>&cursor=<cursor>',
       health: 'GET /health'
@@ -284,6 +355,7 @@ app.get('/', (c) => {
 export default app;
 
 // For Node.js server
+//@ts-ignore
 if (typeof Bun === 'undefined') {
   const port = parseInt(process.env.PORT || '3000');
   
